@@ -1,108 +1,122 @@
 #include <time.h>
 #include <memory>
 #include <iostream>
-extern "C" {
+extern "C"
+{
 #include <immintrin.h>
 }
 
 using namespace std;
 
+// COUNTER TYPE //
 typedef unsigned long long bench_t;
 
 static bench_t before;
 static bench_t after;
 
+// ASKS FOR THE TIME STAMP COUNTER (= WHAT TIME IS IT PLEASE ?)//
 static inline bench_t cycles(void) {
-    unsigned int hi, lo;
-    __asm__ __volatile__ ("rdtsc\n\t":"=a" (lo), "=d"(hi));
-    return ((bench_t) lo) | (((bench_t) hi) << 32);
+	unsigned int hi, lo;
+	__asm__ __volatile__ ("rdtsc\n\t":"=a" (lo), "=d"(hi));
+	return ((bench_t) lo) | (((bench_t) hi) << 32);
 }
 
-// ------------------------------------------------------------
-// Horner escalar para float (correcto)
-// coef[0] = término constante, coef[size-1] = mayor grado
-// ------------------------------------------------------------
-float horner_scalar(float X, const float *coef, int size) {
-    float acc = 0.0f;
-    for (int i = size - 1; i >= 0; --i) {
-        acc = acc * X + coef[i];
-    }
-    return acc;
+// Función escalar adaptada a float para comparar
+float horner(float X, float *coef, long size){
+	float ACC = 0.0f;
+	int i;
+	for(i = 0; i < size; i++){
+		ACC = (ACC + coef[i]) * X;
+	}
+	return ACC;	
 }
 
-// ------------------------------------------------------------
-// Horner SIMD con AVX (float) para 8 valores de X en paralelo
-// X: __m256 con 8 valores de X
-// coef: coeficientes del polinomio (mismos para las 8 evaluaciones)
-// Retorna __m256 con los 8 resultados
-// ------------------------------------------------------------
-__m256 horner_simd(__m256 X, const float *coef, int size) {
-    __m256 acc = _mm256_setzero_ps();
-    for (int i = size - 1; i >= 0; --i) {
-        __m256 c = _mm256_set1_ps(coef[i]);
-        acc = _mm256_add_ps(_mm256_mul_ps(acc, X), c);
-    }
-    return acc;
+// Función AVX intrínseca modificada para float
+float horner_intrinsic(float X, float *coef, long size){
+	float *R, P;
+	int i;
+	__m256 *ymm0, X256, Y;	
+	
+	ymm0 = (__m256*)coef; 
+	
+	// Precalculamos las potencias de X necesarias
+	float X2 = X*X;
+	float X3 = X2*X;
+	float X4 = X3*X;
+	float X5 = X4*X;
+	float X6 = X5*X;
+	float X7 = X6*X;
+	float X8 = X7*X;
+	
+	// Usamos _ps (packed single) en lugar de _pd (packed double)
+	X256 = _mm256_set1_ps(X8);
+	Y = _mm256_set1_ps(0.0f);
+    
+    // Un registro de 256 bits ahora procesa 8 floats por iteración
+	for(i = 0; i < size/8 - 1; i++){
+		Y = _mm256_add_ps(Y, ymm0[i]);
+		Y = _mm256_mul_ps(Y, X256);
+	}
+	
+	Y = _mm256_add_ps(Y, ymm0[i]);
+	
+	R = (float *)(&Y);
+	
+	// La reconstrucción final debe abarcar las 8 posiciones (R[0] a R[7])
+	P  = R[7] * X;
+	P += R[6] * X2;
+	P += R[5] * X3;
+	P += R[4] * X4;
+	P += R[3] * X5;
+	P += R[2] * X6;
+	P += R[1] * X7;
+	P += R[0] * X8;
+
+	return P;
 }
 
-int main() {
-    const int SIZE = 10000;
-    const int NUM_TRIALS = 100000;
-    const float X_val = 1.1f;
+int main(){
+	alignas(32) float coef[4000]; // Cambiado a float (aunque no se usa abajo)
+	float X = 1.1f;
+	float R;
+	int i, num_trails = 100000;
+	
+	clock_t t1, t2;
+	
+	srand(time(NULL));	
 
-    // Alineación para AVX
-    alignas(32) float coef[SIZE];
-    alignas(32) float X_arr[8];
+	float *coeficientes;
+	int j;
+	// Alojamiento alineado a 32 bytes para floats
+	coeficientes = (float *)_mm_malloc(10000 * sizeof(float), 32);
 
-    // Inicializar coeficientes aleatorios
-    srand(time(NULL));
-    for (int i = 0; i < SIZE; i++) {
-        coef[i] = (float)(rand() % 1000) / 1000.0f;
-    }
-
-    // Llenar los 8 valores de X (todos iguales para comparar)
-    for (int i = 0; i < 8; i++) {
-        X_arr[i] = X_val;
-    }
-
-    // Cargar X en un registro AVX
-    __m256 X_vec = _mm256_load_ps(X_arr);
-
-    // --------------------------------------------------------
-    // Prueba de correctitud
-    // --------------------------------------------------------
-    float res_scalar = horner_scalar(X_val, coef, SIZE);
-    __m256 res_simd_vec = horner_simd(X_vec, coef, SIZE);
-    alignas(32) float res_simd[8];
-    _mm256_store_ps(res_simd, res_simd_vec);
-
-    cout << "Scalar: " << res_scalar << endl;
-    cout << "SIMD:   " << res_simd[0] << " (deberían coincidir)" << endl;
-
-    // --------------------------------------------------------
-    // Benchmark escalar
-    // --------------------------------------------------------
-    clock_t t1 = clock();
-    for (int j = 0; j < NUM_TRIALS; j++) {
-        volatile float r = horner_scalar(X_val, coef, SIZE);
-    }
-    clock_t t2 = clock();
-    double diff_scalar = ((double)(t2 - t1)) / CLOCKS_PER_SEC;
-    cout << "Tiempo escalar: " << diff_scalar << " s" << endl;
-
-    // --------------------------------------------------------
-    // Benchmark SIMD
-    // --------------------------------------------------------
-    t1 = clock();
-    for (int j = 0; j < NUM_TRIALS; j++) {
-        __m256 r = horner_simd(X_vec, coef, SIZE);
-        // Evitar optimización excesiva
-        alignas(32) float tmp[8];
-        _mm256_store_ps(tmp, r);
-    }
-    t2 = clock();
-    double diff_simd = ((double)(t2 - t1)) / CLOCKS_PER_SEC;
-    cout << "Tiempo SIMD:    " << diff_simd << " s" << endl;
-
-    return 0;
+	for(j = 0; j < 1; j++){
+		for(i = 0; i < 10000; i++){
+			coeficientes[i] = (float)(rand()%1000)/1000.0f;
+			if(i < 10)
+				cout << coeficientes[i] << endl;
+		}
+		R = horner(X, coeficientes, 10000);
+		cout << "Escalar: " << R << endl;
+		R = horner_intrinsic(X, coeficientes, 10000);
+		cout << "Intrinsics: " << R << endl;		
+	}
+	
+	t1 = clock();
+	for(j = 0; j < num_trails; j++)	
+		R = horner(X, coeficientes, 10000);
+	t2 = clock();
+  	float diff_esc = (((float)t2 - (float)t1) / CLOCKS_PER_SEC );
+  	cout << "Time taken (Escalar): " << diff_esc << endl;
+	
+	t1 = clock();
+	for(j = 0; j < num_trails; j++)	
+		R = horner_intrinsic(X, coeficientes, 10000);
+	t2 = clock();
+  	float diff_int = (((float)t2 - (float)t1) / CLOCKS_PER_SEC );
+  	cout << "Time taken (Intrinsics): " << diff_int << endl;
+		
+	_mm_free(coeficientes);
+	
+	return 0;
 }
